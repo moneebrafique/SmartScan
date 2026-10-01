@@ -5,17 +5,34 @@ import com.smartscan.app.data.FilterType
 import com.smartscan.app.data.Pt
 import org.opencv.android.Utils
 import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
+import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /** Perspective correction + scan filters. */
 object ImageProcessor {
+
+    /**
+     * Tone settings per filter.
+     * black/white = levels points (paper above `white` becomes pure white, ink below `black` pure black),
+     * gamma > 1 darkens mid-tones (ink), chroma scales colour intensity, sharpen = unsharp-mask amount.
+     */
+    private data class Tone(
+        val black: Int, val white: Int, val gamma: Double,
+        val chroma: Double, val sharpen: Double,
+    )
+
+    private val LIGHTEN = Tone(black = 0, white = 238, gamma = 1.0, chroma = 1.0, sharpen = 0.3)
+    private val MAGIC = Tone(black = 28, white = 222, gamma = 1.2, chroma = 1.4, sharpen = 0.6)
+    private val GRAY = Tone(black = 18, white = 232, gamma = 1.15, chroma = 0.0, sharpen = 0.5)
 
     fun process(src: Bitmap, corners: List<Pt>, filter: FilterType, rotation: Int): Bitmap {
         val rgba = Mat()
@@ -57,17 +74,126 @@ object ImageProcessor {
 
     private fun applyFilter(rgba: Mat, filter: FilterType): Mat = when (filter) {
         FilterType.ORIGINAL -> rgba
-        FilterType.MAGIC -> magicColor(rgba)
-        FilterType.LIGHTEN -> Mat().also { rgba.convertTo(it, -1, 1.15, 28.0) }
-        FilterType.GRAYSCALE -> grayscale(rgba)
+        FilterType.MAGIC -> enhanceColor(rgba, MAGIC)
+        FilterType.LIGHTEN -> enhanceColor(rgba, LIGHTEN)
+        FilterType.GRAYSCALE -> enhanceGray(rgba, GRAY)
         FilterType.BW -> blackWhite(rgba)
     }
 
+    // ---------------------------------------------------------------- colour filters
+
     /**
-     * Removes shadows / uneven lighting: estimates the paper background
-     * (text removed by dilation + median blur) and divides it out.
+     * Works in Lab colour space: only the lightness channel is corrected (shadow removal + levels +
+     * sharpening), so ink colours stay true and there are no colour casts. Chroma is then boosted.
      */
-    private fun flattenBackground(channel: Mat): Mat {
+    private fun enhanceColor(rgba: Mat, tone: Tone): Mat {
+        val rgb = Mat()
+        Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
+        val lab = Mat()
+        Imgproc.cvtColor(rgb, lab, Imgproc.COLOR_RGB2Lab)
+        val ch = ArrayList<Mat>()
+        Core.split(lab, ch)
+
+        val l = correctLightness(ch[0], tone)
+        ch[0].release()
+        ch[0] = l
+
+        if (tone.chroma != 1.0) {
+            // a/b are stored with an offset of 128: scale the distance from neutral grey.
+            val beta = 128.0 * (1.0 - tone.chroma)
+            ch[1].convertTo(ch[1], -1, tone.chroma, beta)
+            ch[2].convertTo(ch[2], -1, tone.chroma, beta)
+        }
+
+        // Make the paper itself neutral white (removes yellow/blue paper or light tint).
+        val paperMask = Mat()
+        Imgproc.threshold(ch[0], paperMask, 232.0, 255.0, Imgproc.THRESH_BINARY)
+        ch[1].setTo(Scalar(128.0), paperMask)
+        ch[2].setTo(Scalar(128.0), paperMask)
+        paperMask.release()
+
+        Core.merge(ch, lab)
+        ch.forEach { it.release() }
+        Imgproc.cvtColor(lab, rgb, Imgproc.COLOR_Lab2RGB)
+        lab.release()
+        return rgb
+    }
+
+    private fun enhanceGray(rgba: Mat, tone: Tone): Mat {
+        val gray = Mat()
+        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        val out = correctLightness(gray, tone)
+        gray.release()
+        return out
+    }
+
+    /** Shadow removal -> levels/gamma -> sharpen, on an 8-bit single channel. */
+    private fun correctLightness(channel: Mat, tone: Tone): Mat {
+        val bg = estimateBackground(channel)
+        val flat = Mat()
+        Core.divide(channel, bg, flat, 255.0)
+        bg.release()
+
+        val lut = levelsLut(tone.black, tone.white, tone.gamma)
+        val leveled = Mat()
+        Core.LUT(flat, lut, leveled)
+        flat.release(); lut.release()
+
+        sharpen(leveled, tone.sharpen)
+        return leveled
+    }
+
+    /**
+     * Estimates the paper's brightness everywhere (removes text by a max filter, smooths it),
+     * so dividing by it evens out shadows and uneven light. Gain is capped so that photos or
+     * big dark areas on the page are not blown out to white.
+     */
+    private fun estimateBackground(channel: Mat): Mat {
+        val f = (1000.0 / max(channel.cols(), channel.rows())).coerceAtMost(1.0)
+        val small = Mat()
+        Imgproc.resize(channel, small, Size(), f, f, Imgproc.INTER_AREA)
+
+        var k = max(small.cols(), small.rows()) / 60
+        if (k % 2 == 0) k += 1
+        k = k.coerceAtLeast(9)
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble()))
+        Imgproc.dilate(small, small, kernel)
+        kernel.release()
+        Imgproc.medianBlur(small, small, (k * 2 + 1).coerceAtMost(255))
+        Imgproc.GaussianBlur(small, small, Size(0.0, 0.0), k.toDouble())
+
+        val bg = Mat()
+        Imgproc.resize(small, bg, channel.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        small.release()
+
+        val paper = Core.minMaxLoc(bg).maxVal
+        Core.max(bg, Scalar(max(paper * 0.45, 1.0)), bg) // at most ~2.2x brightening
+        return bg
+    }
+
+    private fun levelsLut(black: Int, white: Int, gamma: Double): Mat {
+        val bytes = ByteArray(256)
+        val range = (white - black).coerceAtLeast(1).toDouble()
+        for (i in 0 until 256) {
+            val v = ((i - black) / range).coerceIn(0.0, 1.0).pow(gamma)
+            bytes[i] = (v * 255.0).roundToInt().coerceIn(0, 255).toByte()
+        }
+        val lut = Mat(1, 256, CvType.CV_8U)
+        lut.put(0, 0, bytes)
+        return lut
+    }
+
+    private fun sharpen(m: Mat, amount: Double) {
+        if (amount <= 0.0) return
+        val blur = Mat()
+        Imgproc.GaussianBlur(m, blur, Size(0.0, 0.0), 1.5)
+        Core.addWeighted(m, 1.0 + amount, blur, -amount, 0.0, m)
+        blur.release()
+    }
+
+    // ---------------------------------------------------------------- black & white (unchanged)
+
+    private fun flattenBackgroundBw(channel: Mat): Mat {
         val f = (800.0 / max(channel.cols(), channel.rows())).coerceAtMost(1.0)
         val small = Mat()
         Imgproc.resize(channel, small, Size(), f, f, Imgproc.INTER_AREA)
@@ -82,43 +208,10 @@ object ImageProcessor {
         return out
     }
 
-    private fun magicColor(rgba: Mat): Mat {
-        val channels = ArrayList<Mat>()
-        Core.split(rgba, channels)
-        val flat = ArrayList<Mat>()
-        for (i in 0 until 3) flat.add(flattenBackground(channels[i]))
-        channels.forEach { it.release() }
-        val rgb = Mat()
-        Core.merge(flat, rgb)
-        flat.forEach { it.release() }
-        rgb.convertTo(rgb, -1, 1.12, -18.0) // extra contrast
-
-        // Boost saturation so stamps, highlights and diagrams pop.
-        val hsv = Mat()
-        Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
-        val hsvCh = ArrayList<Mat>()
-        Core.split(hsv, hsvCh)
-        hsvCh[1].convertTo(hsvCh[1], -1, 1.25, 0.0)
-        Core.merge(hsvCh, hsv)
-        hsvCh.forEach { it.release() }
-        Imgproc.cvtColor(hsv, rgb, Imgproc.COLOR_HSV2RGB)
-        hsv.release()
-        return rgb
-    }
-
-    private fun grayscale(rgba: Mat): Mat {
-        val g = Mat()
-        Imgproc.cvtColor(rgba, g, Imgproc.COLOR_RGBA2GRAY)
-        val out = Mat()
-        Imgproc.createCLAHE(2.0, Size(8.0, 8.0)).apply(g, out)
-        g.release()
-        return out
-    }
-
     private fun blackWhite(rgba: Mat): Mat {
         val g = Mat()
         Imgproc.cvtColor(rgba, g, Imgproc.COLOR_RGBA2GRAY)
-        val flat = flattenBackground(g)
+        val flat = flattenBackgroundBw(g)
         g.release()
         var block = max(flat.cols(), flat.rows()) / 60
         if (block % 2 == 0) block += 1
